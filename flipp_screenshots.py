@@ -370,67 +370,80 @@ async def capture_until_ad(
     return out_path, ad_found, detected_brand
 
 
-# ── Slack upload ──────────────────────────────────────────────────────────────
+# ── Email delivery (SendGrid) ─────────────────────────────────────────────────
 
-def upload_to_slack(
+def send_email(
     screenshots: list[Path],
-    channel: str,
+    recipients: list[str],
     brands: list[str],
     date_str: str,
-    token: str,
+    sender: str,
+    api_key: str,
 ) -> None:
+    """
+    Send all screenshots as attachments via SendGrid.
+    Requires a free SendGrid account and API key — no passwords needed.
+    Sign up at https://sendgrid.com, then:
+      Settings → API Keys → Create API Key → "Mail Send" permission only.
+    """
+    import base64
     try:
-        from slack_sdk import WebClient
-        from slack_sdk.errors import SlackApiError
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import (
+            Mail, Attachment, FileContent, FileName, FileType, Disposition,
+        )
     except ImportError:
-        print("  ⚠  slack-sdk not installed — skipping Slack upload. Run: pip install slack-sdk")
+        print("  ⚠  sendgrid not installed — skipping email. Run: pip install sendgrid")
         return
 
-    client = WebClient(token=token)
     brand_text = ", ".join(brands) if brands else "all placements"
 
-    # Group by city
-    by_city: dict[str, list[Path]] = {}
+    # Plain-text summary body
+    lines = [
+        f"Flipp Campaign Screenshot Report — {date_str}",
+        f"Brands: {brand_text}",
+        "",
+        f"{'File':<55} {'Status'}",
+        "─" * 70,
+    ]
     for p in screenshots:
-        # e.g. 2026-06-19_Vancouver_desktop_ad_found.png → city = Vancouver
-        parts = p.stem.split("_")
-        city = parts[1] if len(parts) >= 2 else "Unknown"
-        by_city.setdefault(city, []).append(p)
+        if "no_ad" in p.stem:
+            status = "⚠ No ad detected"
+        else:
+            parts      = p.stem.split("_ad_found_")
+            brand_part = parts[1].replace("-", " ").title() if len(parts) > 1 else "unknown brand"
+            status     = f"✓ Ad found — {brand_part}"
+        lines.append(f"{p.name:<55} {status}")
+    lines += ["", f"{len(screenshots)} screenshots attached."]
 
-    for city, paths in by_city.items():
-        file_uploads = []
-        for path in paths:
-            viewport = "Desktop" if "desktop" in path.stem else "Mobile"
-            if "no_ad" in path.stem:
-                status = "⚠️ No ad detected"
-            else:
-                # Extract brand from filename: date_City_viewport_ad_found_brand-name.png
-                parts      = path.stem.split("_ad_found_")
-                brand_part = parts[1].replace("-", " ").title() if len(parts) > 1 else "unknown brand"
-                status     = f"✅ {brand_part}"
-            file_uploads.append({
-                "file": str(path),
-                "filename": path.name,
-                "title": f"{city} — {viewport} — {status}",
-            })
+    message = Mail(
+        from_email=sender,
+        to_emails=recipients,
+        subject=f"Flipp Campaign Placements — {date_str}",
+        plain_text_content="\n".join(lines),
+    )
 
-        try:
-            client.files_upload_v2(
-                channel=channel,
-                file_uploads=file_uploads,
-                initial_comment=(
-                    f":camera_with_flash: *Flipp Campaign Placements — {city} — {date_str}*\n"
-                    f"Brands: `{brand_text}` | Screens: {len(paths)}"
-                ),
-            )
-            print(f"  ✓ Uploaded {len(paths)} file(s) for {city} → {channel}")
-        except SlackApiError as e:
-            print(f"  ✗ Slack error for {city}: {e.response['error']}")
+    # Attach every screenshot
+    for path in screenshots:
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode()
+        message.add_attachment(Attachment(
+            FileContent(encoded),
+            FileName(path.name),
+            FileType("image/png"),
+            Disposition("attachment"),
+        ))
+
+    try:
+        SendGridAPIClient(api_key).send(message)
+        print(f"  ✓ Email sent to: {', '.join(recipients) if isinstance(recipients, list) else recipients}")
+    except Exception as e:
+        print(f"  ✗ Email failed: {e}")
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-async def run(brands: list[str], output_dir: Path, slack_channel: str, slack_token: str, max_attempts: int) -> None:
+async def run(brands: list[str], output_dir: Path, recipients: list[str], email_sender: str, email_password: str, max_attempts: int) -> None:
     date_str = datetime.now().strftime("%Y-%m-%d")
     run_dir  = output_dir / date_str
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -486,11 +499,11 @@ async def run(brands: list[str], output_dir: Path, slack_channel: str, slack_tok
     print(f"{'═'*58}")
     print(f"  {len(all_screenshots)} screenshots saved → {run_dir}\n")
 
-    if slack_token and slack_channel:
-        print("📤 Uploading to Slack…")
-        upload_to_slack(all_screenshots, slack_channel, brands, date_str, slack_token)
-    elif slack_channel and not slack_token:
-        print("⚠  --slack-channel set but SLACK_BOT_TOKEN env var is missing.")
+    if recipients and email_sender and email_password:
+        print("📤 Sending email via SendGrid…")
+        send_email(all_screenshots, recipients, brands, date_str, email_sender, email_password)
+    elif recipients and not (email_sender and email_password):
+        print("⚠  Recipients set but EMAIL_SENDER or SENDGRID_API_KEY env var is missing.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -501,40 +514,43 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python flipp_screenshots.py --brands "Coca-Cola, Nike, Lays"
-  python flipp_screenshots.py --brands "Samsung" --attempts 20 --slack-channel "#brand-campaigns"
+  python flipp_screenshots.py --brands "Coca-Cola, Nike, Lays" --to "team@flipp.com,alice@flipp.com"
+  python flipp_screenshots.py --brands "Samsung" --attempts 20 --to "team@flipp.com"
 
 Environment variables:
-  SLACK_BOT_TOKEN    Slack bot token (needs files:write + chat:write scopes)
-  SLACK_CHANNEL      Default Slack channel (overridden by --slack-channel)
+  EMAIL_SENDER        Address to send from — must be verified in SendGrid
+  SENDGRID_API_KEY    API key from sendgrid.com → Settings → API Keys
+  EMAIL_RECIPIENTS    Comma-separated fallback recipient list
         """,
     )
     parser.add_argument("--brands", "-b", type=str, default="",
-        help='Comma-separated brand names live today — included in Slack message')
+        help="Comma-separated brand names live today")
     parser.add_argument("--output", "-o", type=str, default="./flipp_screenshots",
         help="Root output folder (default: ./flipp_screenshots)")
     parser.add_argument("--attempts", "-a", type=int, default=15,
         help="Max page reloads per city/viewport before giving up (default: 15)")
-    parser.add_argument("--slack-channel", type=str,
-        default=os.environ.get("SLACK_CHANNEL", ""),
-        help="Slack channel to post to (e.g. #brand-campaigns)")
+    parser.add_argument("--to", type=str,
+        default=os.environ.get("EMAIL_RECIPIENTS", ""),
+        help="Comma-separated recipient email addresses")
 
-    args   = parser.parse_args()
-    brands = [b.strip() for b in args.brands.split(",") if b.strip()]
+    args       = parser.parse_args()
+    brands     = [b.strip() for b in args.brands.split(",") if b.strip()]
+    recipients = [r.strip() for r in args.to.split(",") if r.strip()]
 
     print("🎯 Flipp Campaign Screenshot Tool")
     print(f"   Cities   : Vancouver · Toronto · Montreal")
     print(f"   Brands   : {', '.join(brands) if brands else '(none specified)'}")
     print(f"   Attempts : up to {args.attempts} reloads per city/viewport")
     print(f"   Output   : {args.output}/{{date}}/")
-    print(f"   Slack    : {args.slack_channel or '(not configured)'}")
+    print(f"   Email to : {', '.join(recipients) if recipients else '(not configured)'}")
     print()
 
     asyncio.run(run(
         brands=brands,
         output_dir=Path(args.output),
-        slack_channel=args.slack_channel,
-        slack_token=os.environ.get("SLACK_BOT_TOKEN", ""),
+        recipients=recipients,
+        email_sender=os.environ.get("EMAIL_SENDER", ""),
+        email_password=os.environ.get("SENDGRID_API_KEY", ""),
         max_attempts=args.attempts,
     ))
 

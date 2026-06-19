@@ -1,2 +1,2 @@
 playwright==1.44.0
-slack-sdk==3.27.2
+sendgrid==6.11.0
