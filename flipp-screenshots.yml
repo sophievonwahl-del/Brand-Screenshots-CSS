@@ -1,0 +1,70 @@
+name: Flipp Campaign Screenshots
+
+on:
+  # ── Automatic: runs every weekday at 9:30am ET (13:30 UTC) ─────────────────
+  schedule:
+    - cron: "30 13 * * 1-5"
+
+  # ── Manual: trigger from GitHub UI with today's brand list ─────────────────
+  # Go to Actions → Flipp Campaign Screenshots → Run workflow
+  workflow_dispatch:
+    inputs:
+      brands:
+        description: "Today's brands (comma-separated, e.g. Coca-Cola, Nike, Lays)"
+        required: false
+        default: ""
+      attempts:
+        description: "Max reloads per city before giving up"
+        required: false
+        default: "15"
+      slack_channel:
+        description: "Slack channel override (leave blank to use repo secret)"
+        required: false
+        default: ""
+
+jobs:
+  screenshots:
+    name: Capture & post screenshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Playwright ────────────────────────────────────────────────────────
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      # ── 4. Run screenshot script ─────────────────────────────────────────────
+      - name: Capture Flipp screenshots
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          # Use manual input channel if provided, otherwise fall back to repo secret
+          SLACK_CHANNEL: ${{ github.event.inputs.slack_channel || secrets.SLACK_CHANNEL }}
+        run: |
+          python flipp_screenshots.py \
+            --brands "${{ github.event.inputs.brands || '' }}" \
+            --attempts "${{ github.event.inputs.attempts || '15' }}" \
+            --slack-channel "${{ github.event.inputs.slack_channel || '' }}" \
+            --output ./screenshots
+
+      # ── 5. Upload screenshots as workflow artifact (backup / audit trail) ────
+      - name: Upload screenshots artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flipp-screenshots-${{ github.run_id }}
+          path: ./screenshots/
+          retention-days: 30
